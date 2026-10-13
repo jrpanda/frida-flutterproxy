@@ -1,5 +1,14 @@
 # frida-flutterproxy
-A Frida script for intercepting traffic on Android, iOS Flutter applications (arm64, x86_64)<br>
+
+> [!NOTE]
+> **backported for frida 16.1.4**
+
+| frida ≤ 16.x | frida 17+ |
+|---|---|
+| `Module.findExportByName(null, name)` | `Module.getGlobalExportByName(name)` |
+| `Module.findBaseAddress(target_flutter_library)` | `Process.getModuleByName(target_flutter_library).base` |
+
+A Frida script for intercepting traffic on Android, iOS Flutter applications (arm64 only)<br>
 Tested on a few flutter apps (e.g., Google Ads, Naver Blog, Naver Knowledge iN, 삼쩜삼, BMW, Nubank(Android), Universal Studios hollywood, Demaecan(Android), Alibaba.com)<br>
 What does this script do? memory scan and hook some functions. check my [blog post](https://hackcatml.tistory.com/197)!
 

@@ -2,8 +2,8 @@
 var appId = null;
 var appId_iOS = null;
 
-var BURP_PROXY_IP = null;
-var BURP_PROXY_PORT = null;
+var BURP_PROXY_IP = "null";   // "YOUR_IP"
+var BURP_PROXY_PORT = null; // YOUR_PORT
 
 var flutter_base = null;
 var flutter_size = null;
@@ -42,6 +42,28 @@ function findAppId() {
     } else {
         return ObjC.classes.NSBundle.mainBundle().bundleIdentifier().toString();
     }
+}
+
+// Is the pointer executable code belonging to the flutter library?
+// Deliberately asks the OS about the mapping instead of using PT_LOAD_text_p_vaddr /
+// TEXT_segment_text_section_offset: on some libflutter.so builds the first PT_LOAD is the
+// R-E segment at vaddr 0 (so parseElf files it as "rodata") and PT_LOAD_text_p_vaddr ends up
+// on the RW data segment, and android libraries can have several executable segments.
+function isInTextSection(p) {
+    if (p == null || flutter_base == null) {
+        return false;
+    }
+    var addr = ptr(p);
+    var module = Process.findModuleByAddress(addr);
+    if (module === null || module.base.compare(flutter_base) !== 0) {
+        return false;
+    }
+    var range = Process.findRangeByAddress(addr);
+    if (range === null) {
+        // Cannot tell: being inside the flutter module is good enough to disambiguate
+        return true;
+    }
+    return range.protection.indexOf('x') !== -1;
 }
 
 // Convert hex to byte string
@@ -106,13 +128,13 @@ function scanMemory(scan_start_addr, scan_size, pattern, for_what) {
             if (for_what == "ssl_client") {
                 ssl_client_string_pattern_found_addr = address;
                 console.log(`[*] ssl_client string pattern found at: ${address}`);
-            } 
+            }
             else if (for_what == "ssl_client_adrp_add") {
                 var adrp, add;
                 var disasm = Instruction.parse(address);
                 if (disasm.mnemonic == "adrp") {
                     adrp = disasm.operands.find(op => op.type === 'imm')?.value;
-                    
+
                     disasm = Instruction.parse(disasm.next);
                     if (disasm.mnemonic != "add") {
                         disasm = Instruction.parse(disasm.next);
@@ -122,7 +144,9 @@ function scanMemory(scan_start_addr, scan_size, pattern, for_what) {
                     if (adrp != undefined && add != undefined && ptr(adrp).add(add).toString() == ssl_client_string_pattern_found_addr.toString()) {
                         console.log(`[*] Found adrp add address: ${address}`);
                         // As we trace back, disassemble to find the address of the verify_cert_chain function (https://blog.weghos.com/flutter/engine/third_party/boringssl/src/ssl/ssl_x509.cc.html#_ZN4bsslL41ssl_crypto_x509_session_verify_cert_chainEP14ssl_session_stPNS_13SSL_HANDSHAKEEPh)
-                        for (let off = 0;; off += 4) {
+                        // Bounded only to stop an unbounded back-walk hanging the agent; kept wide
+                        // because real call sites sit up to ~0x5cc bytes past the prologue.
+                        for (let off = 0; off < 0x1000; off += 4) {
                             disasm = Instruction.parse(address.sub(off));
                             if (disasm.mnemonic == "sub") {
                                 disasm = Instruction.parse(disasm.next);
@@ -161,10 +185,10 @@ function scanMemory(scan_start_addr, scan_size, pattern, for_what) {
                                     }
                                     verify_cert_chain_func_addr = address.sub(off);
                                     console.log(`[*] Found verify_cert_chain function address: ${verify_cert_chain_func_addr}`);
-                                    break; 
+                                    break;
                                 } else {
                                     continue;
-                                } 
+                                }
                             } catch (error) {
                                 continue;
                             }
@@ -173,18 +197,23 @@ function scanMemory(scan_start_addr, scan_size, pattern, for_what) {
                 }
             }
             else if (for_what == "handshake") {
-                for (let off = 0;; off += 1) {
-                    var arrayBuff = new Uint8Array(ptr(address).sub(0x6).sub(off).readByteArray(6));
-                    var hexarray = convertArrayBufferToHex(arrayBuff);
-                    if (hexarray == "2e 2e 2f 2e 2e 2f") {  // "../../"
-                        handshake_string_pattern_found_addr = ptr(address).sub(0x6).sub(off);
-                        console.log(`[*] handshake string pattern found at: ${address}`);
+                // adrp/add materialises the address of the whole C string, so walk back to the start of
+                // the string (the NUL terminating the previous one) instead of looking for a literal
+                // "../../": this build's path is "../../../flutter/third_party/..." and matching "../../"
+                // stopped 3 bytes into it, so the address comparison below could never succeed.
+                handshake_string_pattern_found_addr = null;
+                var max_string_walk = 0x200;
+                for (let off = 1; off <= max_string_walk; off += 1) {
+                    if (ptr(address).sub(off).readU8() == 0x00) {
+                        handshake_string_pattern_found_addr = ptr(address).sub(off - 1);
                         break;
                     }
-                    else {
-                        continue;
-                    }
                 }
+                if (handshake_string_pattern_found_addr == null) {
+                    console.log("[!] Could not find the start of the handshake.cc string");
+                    return;
+                }
+                console.log(`[*] handshake string pattern found at: ${handshake_string_pattern_found_addr}`);
                 // Get the iOS app id. if it's too early app crashes when spawning the iOS flutter app. this location is safe.
                 appId_iOS = findAppId();
             }
@@ -193,7 +222,7 @@ function scanMemory(scan_start_addr, scan_size, pattern, for_what) {
                 var disasm = Instruction.parse(address);
                 if (disasm.mnemonic == "adrp") {
                     adrp = disasm.operands.find(op => op.type === 'imm')?.value;
-                    
+
                     disasm = Instruction.parse(disasm.next);
                     if (disasm.mnemonic != "add") {
                         disasm = Instruction.parse(disasm.next);
@@ -203,7 +232,9 @@ function scanMemory(scan_start_addr, scan_size, pattern, for_what) {
                     if (adrp != undefined && add != undefined && ptr(adrp).add(add).toString() == handshake_string_pattern_found_addr.toString()) {
                         console.log(`[*] Found adrp add address: ${address}`);
                         // As we trace back, disassemble to find the address of the ssl_verify_peer_cert function (https://blog.weghos.com/flutter/engine/third_party/boringssl/src/ssl/handshake.cc.html#_ZN4bssl20ssl_verify_peer_certEPNS_13SSL_HANDSHAKEE)
-                        for (let off = 0;; off += 4) {
+                        // Bounded only to stop an unbounded back-walk hanging the agent; kept wide
+                        // because real call sites sit up to ~0x5cc bytes past the prologue.
+                        for (let off = 0; off < 0x1000; off += 4) {
                             disasm = Instruction.parse(address.sub(off));
                             if (disasm.mnemonic == "sub") {
                                 disasm = Instruction.parse(disasm.next);
@@ -224,7 +255,33 @@ function scanMemory(scan_start_addr, scan_size, pattern, for_what) {
                 console.log(`[*] Socket_CreateConnect string pattern found at: ${address}`);
             }
             else if (for_what == "Socket_CreateConnect_func_addr") {
-                Socket_CreateConnect_func_addr = address.sub(0x10).readPointer();
+                // The Dart native entry is a 3-field struct {name, function, argument_count}, but the
+                // field order varies between engine builds. Disambiguate with the argument_count field:
+                // it is the only one holding a small integer, so it tells us which layout we are on.
+                //   {name, func, argc}: argc at name+0x10, func at name+0x8   (current iOS builds)
+                //   {func, argc, name}: argc at name-0x08, func at name-0x10
+                Socket_CreateConnect_func_addr = null;
+                var entry_layouts = [
+                    { argc_offset: 0x10, func_offset: 0x8 },
+                    { argc_offset: -0x8, func_offset: -0x10 },
+                ];
+                for (var l = 0; l < entry_layouts.length; l++) {
+                    try {
+                        var argc = address.add(entry_layouts[l].argc_offset).readU64().toNumber();
+                        var candidate = address.add(entry_layouts[l].func_offset).readPointer();
+                        if (argc > 0 && argc < 0x100 && isInTextSection(candidate)) {
+                            Socket_CreateConnect_func_addr = candidate;
+                            console.log(`[*] Native entry layout: function at name+0x${entry_layouts[l].func_offset.toString(16)}, argument_count ${argc}`);
+                            break;
+                        }
+                    } catch (error) {
+                        continue;
+                    }
+                }
+                if (Socket_CreateConnect_func_addr == null) {
+                    console.log("[!] Could not resolve the function pointer of the Socket_CreateConnect native entry, skipping this match");
+                    return;
+                }
                 console.log(`[*] Found Socket_CreateConnect function address: ${Socket_CreateConnect_func_addr}`);
                 /* arm64
                     Socket_CreateConnect function looks like this.
@@ -260,10 +317,13 @@ function scanMemory(scan_start_addr, scan_size, pattern, for_what) {
                     mov             esi, 2
                     call            sub_AB2790
                 */
-               
+
                 if (Process.arch == 'arm64') {
                     var bl_count = 0;
-                    for (let off = 0;; off += 4) {
+                    // Bounded: an unbounded walk runs off the end of the function and hangs the
+                    // agent when the expected two bl instructions are not there.
+                    var max_scan_bytes = 0x200;
+                    for (let off = 0; off < max_scan_bytes; off += 4) {
                         let disasm = Instruction.parse(Socket_CreateConnect_func_addr.add(off));
                         if (disasm.mnemonic == "bl") {
                             bl_count++;
@@ -275,10 +335,11 @@ function scanMemory(scan_start_addr, scan_size, pattern, for_what) {
                                 continue;
                             }
                         }
-                    } 
+                    }
                 } else if (Process.arch == 'x64') {
                     var call_count = 0;
-                    for (let off = 0;; off += 1) 
+                    var max_scan_bytes = 0x300;
+                    for (let off = 0; off < max_scan_bytes; off += 1)
                     {
                         try {
                             let disasm = Instruction.parse(Socket_CreateConnect_func_addr.add(off));
@@ -296,9 +357,12 @@ function scanMemory(scan_start_addr, scan_size, pattern, for_what) {
                             continue;
                         }
                     }
-                }               
+                }
+                if (GetSockAddr_func_addr == null) {
+                    console.log("[!] Could not find the GetSockAddr branch inside Socket_CreateConnect");
+                }
             }
-        }, 
+        },
         onComplete: function(){
             // Scan adrp add opcode on the .text section to find the function which has "ssl_client" string
             if (for_what == "ssl_client" && ssl_client_string_pattern_found_addr != null) {
@@ -315,7 +379,11 @@ function scanMemory(scan_start_addr, scan_size, pattern, for_what) {
                 }
             }
             else if (for_what == "handshake" && handshake_string_pattern_found_addr != null) {
-                var adrp_add_pattern = "?2 ?? 00 ?0 42 ?? ?? 91 00 02 80 52 21 22 80 52 c3 29 80 52";
+                // The last instruction of the pattern is "mov w3, #<line>", the handshake.cc source line
+                // number of the OPENSSL_PUT_ERROR call. It moves with every boringssl update, which made
+                // this scan return nothing. Wildcard the immediate but keep the movz-into-w3 shape;
+                // "mov w1, #0x111" (SSL_R_CERTIFICATE_VERIFY_FAILED) still pins it to a single site.
+                var adrp_add_pattern = "?2 ?? 00 ?0 42 ?? ?? 91 00 02 80 52 21 22 80 52 ?3 ?? 80 52";
                 // In case we don't get the iOS app id yet, try to get it again after 0.1 second. This happens when spawning the iOS Flutter app
                 if (appId_iOS == null) {
                     Thread.sleep(0.1);
@@ -334,7 +402,11 @@ function scanMemory(scan_start_addr, scan_size, pattern, for_what) {
                     scanMemory(flutter_base.add(PT_GNU_RELRO_p_vaddr), PT_GNU_RELRO_p_memsz, addr_to_find, "Socket_CreateConnect_func_addr");
                 }
                 else if (Process.platform === 'darwin') {
-                    scanMemory(flutter_base.add(DATA_segment_const_section_offset), DATA_segment_const_section_size, addr_to_find, "Socket_CreateConnect_func_addr");
+                    if (DATA_segment_const_section_offset === null || DATA_segment_const_section_size === null) {
+                        console.log("[!] const section not parsed, cannot scan for the Socket_CreateConnect function address");
+                    } else {
+                        scanMemory(flutter_base.add(DATA_segment_const_section_offset), DATA_segment_const_section_size, addr_to_find, "Socket_CreateConnect_func_addr");
+                    }
                 }
             }
             console.log("[*] scan memory done");
@@ -380,7 +452,7 @@ var p_types = {
 
 function getExportFunction(name, ret, args) {
     var funcPtr;
-    funcPtr = Module.getGlobalExportByName(name);
+    funcPtr = Module.findExportByName(null, name);
     if (funcPtr === null) {
         console.log("cannot find " + name);
         return null;
@@ -408,7 +480,7 @@ function parseElf(base) {
     if (module !== null) {
         fd = open(Memory.allocUtf8String(module.path), O_RDONLY, 0);
     }
-    
+
     // Read elf header
     var magic = "464c457f"
     var elf_magic = base.readU32()
@@ -574,65 +646,98 @@ function parseElf(base) {
 
 /* Parsing MachO function */
 function parseMachO(base) {
-    base = ptr(base)
+    base = ptr(base);
     var magic = base.readU32();
-    var is64bit = false;
-    if (magic == 0xfeedfacf) {
-        is64bit = true;
-        var number_of_commands_offset = 0x10
-        var command_size_offset = 0x4
-        var segment_name_offset = 0x8
-        var vm_address_offset = 0x18
-        var vm_size_offset = 0x20
-        var file_offset = 0x28
-        var number_of_sections_offset = 0x40
-        var section64_header_base_offset = 0x48
-        var section64_header_size = 0x50
-    } else {
-        console.log('Unknown magic:' + magic);
+    if (magic != 0xfeedfacf) {
+        console.log('[!] Unknown or unsupported magic: 0x' + magic.toString(16) + ' (only 64-bit MachO is supported)');
+        return;
     }
+
+    var LC_SEGMENT_64 = 0x19;
+    var number_of_commands_offset = 0x10;
+    var load_command_size_offset = 0x4;
+    var segment_name_offset = 0x8;
+    var vm_address_offset = 0x18;
+    var number_of_sections_offset = 0x40;
+    var section64_header_base_offset = 0x48;
+    var section64_header_size = 0x50;
+    // struct section_64: sectname[16], segname[16], addr(u64)@0x20, size(u64)@0x28, offset(u32)@0x30
+    var section_addr_offset = 0x20;
+    var section_size_offset = 0x28;
+
     var cmdnum = base.add(number_of_commands_offset).readU32();
-    // send({'parseMachO': {'cmdnum': cmdnum}})
-    var cmdoff = is64bit ? 0x20 : 0x1C;
-    for (var i = 0; i < cmdnum; i++) {
+    var cmdoff = 0x20;
+    var text_segment_vmaddr = null;
+    // Collect every section first, then pick the ones we need. Section names alone are ambiguous
+    // (e.g. both __TEXT and __DATA_CONST have a __const), so key on "segment,section".
+    var sections = {};
+
+    for (var cmd_index = 0; cmd_index < cmdnum; cmd_index++) {
         var cmd = base.add(cmdoff).readU32();
-        var cmdsize = base.add(cmdoff + command_size_offset).readU32();
-        if (cmd === 0x19) { // SEGMENT_64
+        var cmdsize = base.add(cmdoff + load_command_size_offset).readU32();
+        if (cmdsize == 0) {
+            break;
+        }
+        if (cmd === LC_SEGMENT_64) {
             var segname = base.add(cmdoff + segment_name_offset).readUtf8String();
-            var vmaddr = base.add(cmdoff + vm_address_offset).readU32();
-            var vmsize = base.add(cmdoff + vm_size_offset).readU32();
-            var fileoffset = base.add(cmdoff + file_offset).readU32();
-            var nsects = base.add(cmdoff + number_of_sections_offset).readU8();
+            var vmaddr = base.add(cmdoff + vm_address_offset).readU64().toNumber();
+            var nsects = base.add(cmdoff + number_of_sections_offset).readU32();
             var secbase = base.add(cmdoff + section64_header_base_offset);
 
-            if (base.add(cmdoff + command_size_offset).readU32() >= section64_header_base_offset + nsects * section64_header_size) {
-                var TEXT_segment_text_section_index = 0;
-                var TEXT_segment_cstring_section_index = 0;
-                var DATA_segment_const_section_index = 0;
-                for (var i = 0; i < nsects; i++) {
-                    var secname = secbase.add(i * section64_header_size).readUtf8String()
-                    var section_start_offset = secbase.add(i * section64_header_size + 0x30).readU32();                        
+            // flutter_base is where __TEXT got mapped, so every offset we hand out is relative to it
+            if (segname === '__TEXT' && text_segment_vmaddr === null) {
+                text_segment_vmaddr = vmaddr;
+            }
 
-                    if (segname === '__TEXT' && secname === '__text') {
-                        TEXT_segment_text_section_index = i;
-                        TEXT_segment_text_section_offset = section_start_offset;
-                    } else if (segname === '__TEXT' && i == (TEXT_segment_text_section_index + 1)) {
-                        TEXT_segment_text_section_size = section_start_offset - TEXT_segment_text_section_offset;
-                    } else if (segname === '__TEXT' && secname === '__cstring') {
-                        TEXT_segment_cstring_section_index = i;
-                        TEXT_segment_cstring_section_offset = section_start_offset;
-                    } else if (segname === '__TEXT' && i == (TEXT_segment_cstring_section_index + 1)) {
-                        TEXT_segment_cstring_section_size = section_start_offset - TEXT_segment_cstring_section_offset;
-                    } else if (segname === '__DATA' && secname === '__const') {
-                        DATA_segment_const_section_index = i;
-                        DATA_segment_const_section_offset = section_start_offset;
-                    } else if (segname === '__DATA' && i == (DATA_segment_const_section_index + 1)) {
-                        DATA_segment_const_section_size = section_start_offset - DATA_segment_const_section_offset;
-                    }
+            if (text_segment_vmaddr !== null && cmdsize >= section64_header_base_offset + nsects * section64_header_size) {
+                // Use a loop variable of its own: reusing the outer `i` used to clobber the
+                // load command counter and cut the command walk short.
+                for (var sect_index = 0; sect_index < nsects; sect_index++) {
+                    var sechdr = secbase.add(sect_index * section64_header_size);
+                    var secname = sechdr.readUtf8String();
+                    // Derive the offset from the section vmaddr instead of its file offset:
+                    // zero-fill sections (__bss, __common) have no file offset at all.
+                    var section_offset = sechdr.add(section_addr_offset).readU64().toNumber() - text_segment_vmaddr;
+                    // Take the size straight from the section header rather than diffing against the
+                    // next section, which broke whenever the section we want is the last of its segment.
+                    var section_size = sechdr.add(section_size_offset).readU64().toNumber();
+                    sections[segname + ',' + secname] = { offset: section_offset, size: section_size };
                 }
             }
         }
         cmdoff += cmdsize;
+    }
+
+    function pickSection(candidates) {
+        for (var n = 0; n < candidates.length; n++) {
+            if (sections[candidates[n]] !== undefined) {
+                return { key: candidates[n], value: sections[candidates[n]] };
+            }
+        }
+        return null;
+    }
+
+    var text_section = pickSection(['__TEXT,__text']);
+    if (text_section !== null) {
+        TEXT_segment_text_section_offset = text_section.value.offset;
+        TEXT_segment_text_section_size = text_section.value.size;
+    }
+
+    var cstring_section = pickSection(['__TEXT,__cstring']);
+    if (cstring_section !== null) {
+        TEXT_segment_cstring_section_offset = cstring_section.value.offset;
+        TEXT_segment_cstring_section_size = cstring_section.value.size;
+    }
+
+    // Current iOS toolchains move the read-only pointer tables (where the Socket_CreateConnect
+    // native entry lives) into __DATA_CONST,__const. Older builds keep them in __DATA,__const.
+    var const_section = pickSection(['__DATA_CONST,__const', '__DATA,__const']);
+    if (const_section !== null) {
+        DATA_segment_const_section_offset = const_section.value.offset;
+        DATA_segment_const_section_size = const_section.value.size;
+        console.log(`[*] Using ${const_section.key} for the const pointer table: base+0x${DATA_segment_const_section_offset.toString(16)} size 0x${DATA_segment_const_section_size.toString(16)}`);
+    } else {
+        console.log('[!] Could not locate a __const section in __DATA_CONST or __DATA');
     }
 }
 /* Parsing MachO function */
@@ -642,14 +747,14 @@ function hook(target) {
     if (target == "GetSockAddr") {
         // Hook SocketAddress::GetSockAddr function so we can get the address of sockaddr structure
         Interceptor.attach(GetSockAddr_func_addr, {
-            onEnter: function(args) { 
+            onEnter: function(args) {
                 // console.log(`[!] sockaddr: ${args[1]}`);
                 sockaddr = args[1];
             },
             onLeave: function(retval) {}
         })
         // Hook the socket function and replace the IP and port with our burp ones.
-        Interceptor.attach(Module.getGlobalExportByName("socket"), {
+        Interceptor.attach(Module.findExportByName(null, "socket"), {
             onEnter: function(args) {
                 // AF_INET(IPv4) == 2, AF_INET6(IPv6) == 10
                 var overwrite = false;
@@ -695,7 +800,7 @@ function hook(target) {
 
 /* main */
 var target_flutter_library = ObjC.available ? "Flutter.framework/Flutter" : (Java.available ? "libflutter.so" : null);
-if (target_flutter_library != null) { 
+if (target_flutter_library != null) {
     var awaitForCondition = function(callback) {
         var module_loaded = 0;
         var base = null;
@@ -717,13 +822,13 @@ if (target_flutter_library != null) {
             }
         }, 0);
     }
-    
+
     function init(base) {
         flutter_base = ptr(base);
         console.log(`[*] ${target_flutter_library} base: ${flutter_base}`);
         if (Process.platform === 'linux') {
             appId = findAppId();
-            console.log(`[*] package name: ${appId}`);    
+            console.log(`[*] package name: ${appId}`);
         }
 
         var ssl_client_string = '73 73 6C 5F 63 6C 69 65 6E 74 00';
@@ -738,14 +843,18 @@ if (target_flutter_library != null) {
                 // "Socket_CreateConnect" string scan
                 scanMemory(flutter_base, PT_LOAD_rodata_p_memsz, Socket_CreateConnect_string, "Socket_CreateConnect");
             }
-        } 
+        }
         else if (Process.platform === 'darwin') {
             parseMachO(flutter_base);
             // Find verify_peer_cert function address by scanning "third_party/boringssl/src/ssl/handshake.cc" string
+            if (TEXT_segment_cstring_section_offset === null || TEXT_segment_cstring_section_size === null) {
+                console.log("[!] __TEXT,__cstring not parsed, aborting the string scans");
+                return;
+            }
             scanMemory(flutter_base.add(TEXT_segment_cstring_section_offset), TEXT_segment_cstring_section_size, handshake_string, "handshake");
             scanMemory(flutter_base.add(TEXT_segment_cstring_section_offset), TEXT_segment_cstring_section_size, Socket_CreateConnect_string, "Socket_CreateConnect");
         }
-    
+
         var int_getSockAddr = setInterval(() => {
             if (GetSockAddr_func_addr != null) {
                 console.log("[*] Hook GetSockAddr function");
@@ -753,7 +862,7 @@ if (target_flutter_library != null) {
                 clearInterval(int_getSockAddr);
             }
         }, 0);
-        
+
         if (Process.platform === 'linux') {
             var int_verifyCertBypass = setInterval(() => {
                 if (verify_cert_chain_func_addr != null) {
@@ -775,9 +884,39 @@ if (target_flutter_library != null) {
         }
     }
 
-    BURP_PROXY_IP = "10.0.2.2";
-    BURP_PROXY_PORT = 8080;
-
     awaitForCondition(init);
 }
 /* main */
+
+/* ---- DNS fix: resolve internal .loc names that do not exist in public DNS ----
+ * Dart calls getaddrinfo BEFORE connect; if it returns NXDOMAIN it throws
+ * "Failed host lookup" and never reaches the GetSockAddr hook. We rewrite the
+ * hostname to a resolvable IP so getaddrinfo succeeds; GetSockAddr then
+ * redirects the socket to Burp anyway.
+ */
+(function () {
+    var FAKE_IP = BURP_PROXY_IP; // any resolvable IP works; GetSockAddr rewrites the destination regardless
+    var keepAlive = [];          // prevents the GC from freeing the strings during the call
+    ["getaddrinfo", "android_getaddrinfofornet"].forEach(function (name) {
+        var p = Module.findExportByName(null, name) || Module.findExportByName("libc.so", name);
+        if (!p) { return; }
+        try {
+            Interceptor.attach(p, {
+                onEnter: function (args) {
+                    try {
+                        var node = args[0];
+                        if (node.isNull()) { return; }
+                        var host = node.readCString();
+                        if (host && /\.loc$/i.test(host)) {
+                            console.log("[DNS] " + name + " " + host + " -> " + FAKE_IP);
+                            var repl = Memory.allocUtf8String(FAKE_IP);
+                            keepAlive.push(repl);
+                            args[0] = repl;
+                        }
+                    } catch (e) {}
+                }
+            });
+            console.log("[*] Hooked " + name + " to resolve .loc hosts");
+        } catch (e) { console.log("[!] Could not hook " + name + ": " + e); }
+    });
+})();
